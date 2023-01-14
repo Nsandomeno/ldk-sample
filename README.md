@@ -6,6 +6,11 @@ Sample node implementation using LDK.
 git clone https://github.com/lightningdevkit/ldk-sample
 ```
 
+## Usage w/ Polar
+```
+cd ldk-sample
+cargo run polaruser:polarpass@127.0.0.1:18443 ./ 9732 regtest hellolightning 0.0.0.0
+```
 ## Usage
 ```
 cd ldk-sample
