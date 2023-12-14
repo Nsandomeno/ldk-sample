@@ -1,10 +1,21 @@
-use crate::convert::{BlockchainInfo, FeeResponse, FundedTx, NewAddress, RawTx, SignedTx};
+use crate::convert::{
+	BlockchainInfo, FeeResponse, FundedTx, ListUnspentResponse, MempoolMinFeeResponse, NewAddress,
+	RawTx, SignedTx,
+};
+use crate::disk::FilesystemLogger;
+use crate::hex_utils;
 use base64;
+use bitcoin::blockdata::constants::WITNESS_SCALE_FACTOR;
 use bitcoin::blockdata::transaction::Transaction;
-use bitcoin::consensus::encode;
+use bitcoin::consensus::{encode, Decodable, Encodable};
 use bitcoin::hash_types::{BlockHash, Txid};
-use bitcoin::util::address::Address;
+use bitcoin::hashes::Hash;
+use bitcoin::util::address::{Address, Payload, WitnessVersion};
+use bitcoin::{OutPoint, Script, TxOut, WPubkeyHash, XOnlyPublicKey};
 use lightning::chain::chaininterface::{BroadcasterInterface, ConfirmationTarget, FeeEstimator};
+use lightning::events::bump_transaction::{Utxo, WalletSource};
+use lightning::log_error;
+use lightning::util::logger::Logger;
 use lightning_block_sync::http::HttpEndpoint;
 use lightning_block_sync::rpc::RpcClient;
 use lightning_block_sync::{AsyncBlockSourceResult, BlockData, BlockHeaderData, BlockSource};
@@ -16,20 +27,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub struct BitcoindClient {
-	bitcoind_rpc_client: Arc<RpcClient>,
+	pub(crate) bitcoind_rpc_client: Arc<RpcClient>,
 	host: String,
 	port: u16,
 	rpc_user: String,
 	rpc_password: String,
-	fees: Arc<HashMap<Target, AtomicU32>>,
+	fees: Arc<HashMap<ConfirmationTarget, AtomicU32>>,
 	handle: tokio::runtime::Handle,
-}
-
-#[derive(Clone, Eq, Hash, PartialEq)]
-pub enum Target {
-	Background,
-	Normal,
-	HighPriority,
+	logger: Arc<FilesystemLogger>,
 }
 
 impl BlockSource for BitcoindClient {
@@ -54,9 +59,9 @@ impl BlockSource for BitcoindClient {
 const MIN_FEERATE: u32 = 253;
 
 impl BitcoindClient {
-	pub async fn new(
+	pub(crate) async fn new(
 		host: String, port: u16, rpc_user: String, rpc_password: String,
-		handle: tokio::runtime::Handle,
+		handle: tokio::runtime::Handle, logger: Arc<FilesystemLogger>,
 	) -> std::io::Result<Self> {
 		let http_endpoint = HttpEndpoint::for_host(host.clone()).with_port(port);
 		let rpc_credentials =
@@ -69,10 +74,24 @@ impl BitcoindClient {
 				std::io::Error::new(std::io::ErrorKind::PermissionDenied,
 				"Failed to make initial call to bitcoind - please check your RPC user/password and access settings")
 			})?;
-		let mut fees: HashMap<Target, AtomicU32> = HashMap::new();
-		fees.insert(Target::Background, AtomicU32::new(MIN_FEERATE));
-		fees.insert(Target::Normal, AtomicU32::new(2000));
-		fees.insert(Target::HighPriority, AtomicU32::new(5000));
+		let mut fees: HashMap<ConfirmationTarget, AtomicU32> = HashMap::new();
+		fees.insert(ConfirmationTarget::OnChainSweep, AtomicU32::new(5000));
+		fees.insert(
+			ConfirmationTarget::MaxAllowedNonAnchorChannelRemoteFee,
+			AtomicU32::new(25 * 250),
+		);
+		fees.insert(
+			ConfirmationTarget::MinAllowedAnchorChannelRemoteFee,
+			AtomicU32::new(MIN_FEERATE),
+		);
+		fees.insert(
+			ConfirmationTarget::MinAllowedNonAnchorChannelRemoteFee,
+			AtomicU32::new(MIN_FEERATE),
+		);
+		fees.insert(ConfirmationTarget::AnchorChannelFee, AtomicU32::new(MIN_FEERATE));
+		fees.insert(ConfirmationTarget::NonAnchorChannelFee, AtomicU32::new(2000));
+		fees.insert(ConfirmationTarget::ChannelCloseMinimum, AtomicU32::new(MIN_FEERATE));
+
 		let client = Self {
 			bitcoind_rpc_client: Arc::new(bitcoind_rpc_client),
 			host,
@@ -81,6 +100,7 @@ impl BitcoindClient {
 			rpc_password,
 			fees: Arc::new(fees),
 			handle: handle.clone(),
+			logger,
 		};
 		BitcoindClient::poll_for_fee_estimates(
 			client.fees.clone(),
@@ -91,11 +111,21 @@ impl BitcoindClient {
 	}
 
 	fn poll_for_fee_estimates(
-		fees: Arc<HashMap<Target, AtomicU32>>, rpc_client: Arc<RpcClient>,
+		fees: Arc<HashMap<ConfirmationTarget, AtomicU32>>, rpc_client: Arc<RpcClient>,
 		handle: tokio::runtime::Handle,
 	) {
 		handle.spawn(async move {
 			loop {
+				let mempoolmin_estimate = {
+					let resp = rpc_client
+						.call_method::<MempoolMinFeeResponse>("getmempoolinfo", &vec![])
+						.await
+						.unwrap();
+					match resp.feerate_sat_per_kw {
+						Some(feerate) => std::cmp::max(feerate, MIN_FEERATE),
+						None => MIN_FEERATE,
+					}
+				};
 				let background_estimate = {
 					let background_conf_target = serde_json::json!(144);
 					let background_estimate_mode = serde_json::json!("ECONOMICAL");
@@ -145,13 +175,28 @@ impl BitcoindClient {
 					}
 				};
 
-				fees.get(&Target::Background)
-					.unwrap()
-					.store(background_estimate, Ordering::Release);
-				fees.get(&Target::Normal).unwrap().store(normal_estimate, Ordering::Release);
-				fees.get(&Target::HighPriority)
+				fees.get(&ConfirmationTarget::OnChainSweep)
 					.unwrap()
 					.store(high_prio_estimate, Ordering::Release);
+				fees.get(&ConfirmationTarget::MaxAllowedNonAnchorChannelRemoteFee)
+					.unwrap()
+					.store(std::cmp::max(25 * 250, high_prio_estimate * 10), Ordering::Release);
+				fees.get(&ConfirmationTarget::MinAllowedAnchorChannelRemoteFee)
+					.unwrap()
+					.store(mempoolmin_estimate, Ordering::Release);
+				fees.get(&ConfirmationTarget::MinAllowedNonAnchorChannelRemoteFee)
+					.unwrap()
+					.store(background_estimate - 250, Ordering::Release);
+				fees.get(&ConfirmationTarget::AnchorChannelFee)
+					.unwrap()
+					.store(background_estimate, Ordering::Release);
+				fees.get(&ConfirmationTarget::NonAnchorChannelFee)
+					.unwrap()
+					.store(normal_estimate, Ordering::Release);
+				fees.get(&ConfirmationTarget::ChannelCloseMinimum)
+					.unwrap()
+					.store(background_estimate, Ordering::Release);
+
 				tokio::time::sleep(Duration::from_secs(60)).await;
 			}
 		});
@@ -181,7 +226,8 @@ impl BitcoindClient {
 			// LDK gives us feerates in satoshis per KW but Bitcoin Core here expects fees
 			// denominated in satoshis per vB. First we need to multiply by 4 to convert weight
 			// units to virtual bytes, then divide by 1000 to convert KvB to vB.
-			"fee_rate": self.get_est_sat_per_1000_weight(ConfirmationTarget::Normal) as f64 / 250.0,
+			"fee_rate": self
+				.get_est_sat_per_1000_weight(ConfirmationTarget::NonAnchorChannelFee) as f64 / 250.0,
 			// While users could "cancel" a channel open by RBF-bumping and paying back to
 			// themselves, we don't allow it here as its easy to have users accidentally RBF bump
 			// and pay to the channel funding address, which results in loss of funds. Real
@@ -227,49 +273,100 @@ impl BitcoindClient {
 			.await
 			.unwrap()
 	}
+
+	pub async fn list_unspent(&self) -> ListUnspentResponse {
+		self.bitcoind_rpc_client
+			.call_method::<ListUnspentResponse>("listunspent", &vec![])
+			.await
+			.unwrap()
+	}
 }
 
 impl FeeEstimator for BitcoindClient {
 	fn get_est_sat_per_1000_weight(&self, confirmation_target: ConfirmationTarget) -> u32 {
-		match confirmation_target {
-			ConfirmationTarget::Background => {
-				self.fees.get(&Target::Background).unwrap().load(Ordering::Acquire)
-			}
-			ConfirmationTarget::Normal => {
-				self.fees.get(&Target::Normal).unwrap().load(Ordering::Acquire)
-			}
-			ConfirmationTarget::HighPriority => {
-				self.fees.get(&Target::HighPriority).unwrap().load(Ordering::Acquire)
-			}
-		}
+		self.fees.get(&confirmation_target).unwrap().load(Ordering::Acquire)
 	}
 }
 
 impl BroadcasterInterface for BitcoindClient {
-	fn broadcast_transaction(&self, tx: &Transaction) {
-		let bitcoind_rpc_client = self.bitcoind_rpc_client.clone();
-		let tx_serialized = serde_json::json!(encode::serialize_hex(tx));
-		self.handle.spawn(async move {
-			// This may error due to RL calling `broadcast_transaction` with the same transaction
-			// multiple times, but the error is safe to ignore.
-			match bitcoind_rpc_client
-				.call_method::<Txid>("sendrawtransaction", &vec![tx_serialized])
-				.await
-			{
-				Ok(_) => {}
-				Err(e) => {
-					let err_str = e.get_ref().unwrap().to_string();
-					if !err_str.contains("Transaction already in block chain")
-						&& !err_str.contains("Inputs missing or spent")
-						&& !err_str.contains("bad-txns-inputs-missingorspent")
-						&& !err_str.contains("txn-mempool-conflict")
-						&& !err_str.contains("non-BIP68-final")
-						&& !err_str.contains("insufficient fee, rejecting replacement ")
+	fn broadcast_transactions(&self, txs: &[&Transaction]) {
+		// TODO: Rather than calling `sendrawtransaction` in a a loop, we should probably use
+		// `submitpackage` once it becomes available.
+		for tx in txs {
+			let bitcoind_rpc_client = Arc::clone(&self.bitcoind_rpc_client);
+			let tx_serialized = encode::serialize_hex(tx);
+			let tx_json = serde_json::json!(tx_serialized);
+			let logger = Arc::clone(&self.logger);
+			self.handle.spawn(async move {
+				// This may error due to RL calling `broadcast_transactions` with the same transaction
+				// multiple times, but the error is safe to ignore.
+				match bitcoind_rpc_client
+					.call_method::<Txid>("sendrawtransaction", &vec![tx_json])
+					.await
 					{
-						panic!("{}", e);
+						Ok(_) => {}
+						Err(e) => {
+							let err_str = e.get_ref().unwrap().to_string();
+							log_error!(logger,
+									   "Warning, failed to broadcast a transaction, this is likely okay but may indicate an error: {}\nTransaction: {}",
+									   err_str,
+									   tx_serialized);
+							print!("Warning, failed to broadcast a transaction, this is likely okay but may indicate an error: {}\n> ", err_str);
+						}
 					}
-				}
-			}
+			});
+		}
+	}
+}
+
+impl WalletSource for BitcoindClient {
+	fn list_confirmed_utxos(&self) -> Result<Vec<Utxo>, ()> {
+		let utxos = tokio::task::block_in_place(move || {
+			self.handle.block_on(async move { self.list_unspent().await }).0
 		});
+		Ok(utxos
+			.into_iter()
+			.filter_map(|utxo| {
+				let outpoint = OutPoint { txid: utxo.txid, vout: utxo.vout };
+				match utxo.address.payload {
+					Payload::WitnessProgram { version, ref program } => match version {
+						WitnessVersion::V0 => WPubkeyHash::from_slice(program)
+							.map(|wpkh| Utxo::new_v0_p2wpkh(outpoint, utxo.amount, &wpkh))
+							.ok(),
+						// TODO: Add `Utxo::new_v1_p2tr` upstream.
+						WitnessVersion::V1 => XOnlyPublicKey::from_slice(program)
+							.map(|_| Utxo {
+								outpoint,
+								output: TxOut {
+									value: utxo.amount,
+									script_pubkey: Script::new_witness_program(version, program),
+								},
+								satisfaction_weight: 1 /* empty script_sig */ * WITNESS_SCALE_FACTOR as u64 +
+									1 /* witness items */ + 1 /* schnorr sig len */ + 64, /* schnorr sig */
+							})
+							.ok(),
+						_ => None,
+					},
+					_ => None,
+				}
+			})
+			.collect())
+	}
+
+	fn get_change_script(&self) -> Result<Script, ()> {
+		tokio::task::block_in_place(move || {
+			Ok(self.handle.block_on(async move { self.get_new_address().await.script_pubkey() }))
+		})
+	}
+
+	fn sign_tx(&self, tx: Transaction) -> Result<Transaction, ()> {
+		let mut tx_bytes = Vec::new();
+		let _ = tx.consensus_encode(&mut tx_bytes).map_err(|_| ());
+		let tx_hex = hex_utils::hex_str(&tx_bytes);
+		let signed_tx = tokio::task::block_in_place(move || {
+			self.handle.block_on(async move { self.sign_raw_transaction_with_wallet(tx_hex).await })
+		});
+		let signed_tx_bytes = hex_utils::to_vec(&signed_tx.hex).ok_or(())?;
+		Transaction::consensus_decode(&mut signed_tx_bytes.as_slice()).map_err(|_| ())
 	}
 }
